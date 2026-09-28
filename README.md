@@ -333,3 +333,6 @@ Copyright (c) 2026 OSS SLU – TheHealthApp Team.
 Project Lead: Munazzah Rakhangi
 Email: [munazzahrizwan.rakhangi@slu.edu](mailto:munazzahrizwan.rakhangi@slu.edu)
 
+## Easter Egg!
+
+Congratulations! You have found a secret. Your day will be filled with good luck!
