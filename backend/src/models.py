@@ -91,10 +91,10 @@ class UserCreate(BaseModel):
     phone: Annotated[str, StringConstraints(strip_whitespace=True, pattern=r'^\+?[0-9]{10,15}$')]
     password: str
 
-    @field_validator('phone', mode='after')
+    @field_validator('phone', mode='before')
     def normalize_phone(cls, v: str) -> str:
-        if v:
-            return re.sub(r'(?!^\+)[^\d]', '', v)
+        if v and isinstance(v, str):
+            return re.sub(r'(?!^\+)\D', '', v)
         return v
 
     @field_validator('password', mode='after')
@@ -109,6 +109,12 @@ class UserUpdate(BaseModel):
     age: Optional[int] = Field(None, gt=12, lt=121)
     phone: Optional[Annotated[str, StringConstraints(strip_whitespace=True, pattern=r'^\+?[0-9]{10,15}$')]] = None
 
+    @field_validator('phone', mode='before')
+    def normalize_phone(cls, v: Optional[str]) -> Optional[str]:
+        if v and isinstance(v, str):
+            return re.sub(r'(?!^\+)\D', '', v)
+        return v
+    
 class UserLogin(BaseModel):
     username: str; password: str
 
