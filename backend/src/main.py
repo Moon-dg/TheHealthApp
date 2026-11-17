@@ -1,10 +1,11 @@
+import base64
 import os
 import uuid
 import bcrypt
 from pathlib import Path
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
-from typing import Annotated
+from datetime import date, datetime, timedelta, timezone
+from typing import Annotated, Optional
 from pymongo.errors import DuplicateKeyError
 
 from fastapi import FastAPI, HTTPException, status, Depends, Request, UploadFile, File
@@ -78,16 +79,31 @@ from .models import (
     ErrorResponse,
     SuccessResponse,
     RevokedToken,
+    HealthRiskAssessment,
     HealthRiskInput,
     HealthRiskOutput,
     ConsentSubmit,
     ConsentStatusData,
     user_has_valid_consent,
+    CURRENT_CONSENT_VERSION,
+    age_from_date_of_birth,
     Questionnaire,
     QuestionnaireSubmit,
-
+    Prescription,
+    PrescriptionCreate,
+    PrescriptionUpdate,
+    PrescriptionResponse,
+    DoseStatus,
+    MedicationDose,
+    MedicationDoseCreate,
+    MedicationDoseResponse,
+    MedicationReminder,
+    MedicationReminderCreate,
+    MedicationReminderUpdate,
+    MedicationReminderResponse,
 )
 from .risk_calculator import calculate_health_risk
+from .health_summary import build_health_summary
 
 limiter = Limiter(key_func=get_remote_address,default_limits=["100 per 15 minutes"])
 security = HTTPBearer()
@@ -171,7 +187,15 @@ def _mongo_connection_string() -> str:
 async def lifespan(app: FastAPI):
     await init_beanie(
         connection_string=_mongo_connection_string(),
-        document_models=[User, RevokedToken, Questionnaire],
+        document_models=[
+            User,
+            RevokedToken,
+            Questionnaire,
+            HealthRiskAssessment,
+            Prescription,
+            MedicationDose,
+            MedicationReminder,
+        ],
     )
     print("Database connection established.")
     yield
@@ -276,7 +300,7 @@ async def signup_user(request: Request, payload: UserCreate):
                 status_code=409,
                 detail={
                     "code": "DUPLICATE_USERNAME",
-                    "message": "Username already exists",
+                    "message": "Username is already in use",
                 },
             ) from exc
 
@@ -309,6 +333,8 @@ async def update_own_profile(payload: UserUpdate, current_user: Annotated[User, 
             )
     for key, value in update_data.items():
         setattr(current_user, key, value)
+    if "date_of_birth" in update_data:
+        current_user.age = None
     current_user.updated_at = datetime.utcnow()
     await current_user.save()
     return SuccessResponse(data=current_user)
@@ -374,6 +400,92 @@ async def get_own_profile(current_user: Annotated[User, Depends(get_current_user
     return SuccessResponse(data=current_user)
 
 
+def _export_profile_photo(photo_url: str | None) -> dict | None:
+    """Embed the stored profile photo so the export does not depend on the server staying reachable."""
+    if not photo_url:
+        return None
+    photo = {"url": photo_url, "content_type": None, "data_base64": None}
+    if not photo_url.startswith("/uploads/"):
+        return photo
+    path = (BASE_DIR / photo_url.lstrip("/")).resolve()
+    if path.parent != UPLOAD_DIR.resolve() or not path.is_file():
+        return photo
+    content_types = {extension: content_type for content_type, extension in ALLOWED_PHOTO_TYPES.items()}
+    photo["content_type"] = content_types.get(path.suffix.lower())
+    photo["data_base64"] = base64.b64encode(path.read_bytes()).decode("ascii")
+    return photo
+
+
+@app.get("/api/v1/users/me/data-export", tags=["User"], summary="Export the current user's stored data")
+async def export_own_data(current_user: Annotated[User, Depends(get_current_user)]):
+    questionnaires = await Questionnaire.find({"user_id": current_user.id}).sort("created_at").to_list()
+    risk_assessments = await HealthRiskAssessment.find({"user_id": current_user.id}).sort("created_at").to_list()
+
+    export = {
+        "schema_version": "1.1",
+        "exported_at": datetime.now(timezone.utc),
+        "profile": {
+            "username": current_user.username,
+            "name": current_user.name,
+            "date_of_birth": current_user.date_of_birth,
+            "age": current_user.age,
+            "gender": current_user.gender,
+            "phone": current_user.phone,
+            "photo_url": current_user.photo_url,
+            "photo": _export_profile_photo(current_user.photo_url),
+            "created_at": current_user.created_at,
+            "updated_at": current_user.updated_at,
+        },
+        "consent": {
+            "consent_given": current_user.consent_given,
+            "data_usage": current_user.data_usage,
+            "marketing": current_user.marketing,
+            "version": current_user.consent_version,
+            "recorded_at": current_user.consent_timestamp,
+            "current_policy_version": CURRENT_CONSENT_VERSION,
+            "valid_for_current_policy": user_has_valid_consent(current_user),
+        },
+        "questionnaires": [
+            {
+                "id": str(record.id),
+                "submitted_at": record.created_at,
+                "updated_at": record.updated_at,
+                "first_name": record.first_name,
+                "last_name": record.last_name,
+                "date_of_birth": record.date_of_birth,
+                "gender": record.gender,
+                "email": record.email,
+                "phone": record.phone,
+                "existing_conditions": record.existing_conditions,
+                "allergies": record.allergies,
+                "current_medications": record.current_medications,
+                "family_history": record.family_history,
+                "exercise_frequency": record.exercise_frequency,
+                "diet_type": record.diet_type,
+                "smoking_status": record.smoking_status,
+                "alcohol_consumption": record.alcohol_consumption,
+                "sleep_hours": record.sleep_hours,
+                "stress_level": record.stress_level,
+            }
+            for record in questionnaires
+        ],
+        "risk_assessments": [
+            {
+                "id": str(record.id),
+                "assessed_at": record.created_at,
+                "result": record.result.model_dump(mode="json"),
+            }
+            for record in risk_assessments
+        ],
+    }
+    return JSONResponse(
+        content=jsonable_encoder(export),
+        headers={
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @app.post("/api/v1/consent", response_model=SuccessResponse[UserResponse], tags=["Consent"])
 @limiter.limit("10/minute")
 async def submit_consent(
@@ -400,11 +512,16 @@ async def submit_questionnaire(
     payload: QuestionnaireSubmit,
     current_user: Annotated[User, Depends(require_health_consent)],
 ):
+    if current_user.date_of_birth != payload.dateOfBirth:
+        current_user.date_of_birth = payload.dateOfBirth
+        current_user.age = None
+        await current_user.save()
+
     questionnaire = Questionnaire(
         user_id=current_user.id,
         first_name=payload.firstName,
         last_name=payload.lastName,
-        date_of_birth=payload.dateOfBirth,
+        date_of_birth=current_user.date_of_birth.isoformat(),
         gender=payload.gender,
         email=payload.email,
         phone=payload.phone,
@@ -428,6 +545,89 @@ async def submit_questionnaire(
             "questionnaire_id": str(questionnaire.id),
         }
     )
+
+@app.get(
+    "/api/v1/questionnaire/status",
+    response_model=SuccessResponse[dict],
+)
+async def get_questionnaire_status(
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    questionnaire = await Questionnaire.find_one(
+        Questionnaire.user_id == current_user.id
+    )
+
+    return SuccessResponse(
+        data={
+            "completed": questionnaire is not None,
+        }
+    )
+
+@app.get(
+    "/api/v1/users/me/health-summary",
+    response_model=SuccessResponse[dict],
+    tags=["Health Summary"],
+    summary="Generate a personal health summary",
+)
+async def get_health_summary(
+    current_user: Annotated[User, Depends(require_health_consent)],
+    start_date: date | None = None,
+    end_date: date | None = None,
+    start_at: datetime | None = None,
+    end_before: datetime | None = None,
+):
+    if start_date and end_date and start_date > end_date:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Start date must be on or before end date",
+        )
+    if (start_at is None) != (end_before is None) or (
+        start_at is not None and end_before is not None and start_at >= end_before
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Start and end date boundaries must define a valid period",
+        )
+
+    range_start = (
+        _mongo_utc_naive(start_at)
+        if start_at
+        else datetime.combine(start_date, datetime.min.time()) if start_date else None
+    )
+    range_end = (
+        _mongo_utc_naive(end_before)
+        if end_before
+        else datetime.combine(end_date + timedelta(days=1), datetime.min.time()) if end_date else None
+    )
+
+    questionnaire_filter = {"user_id": current_user.id}
+    questionnaire_dates = {}
+    if range_start:
+        questionnaire_dates["$gte"] = range_start
+    if range_end:
+        questionnaire_dates["$lt"] = range_end
+    if questionnaire_dates:
+        questionnaire_filter["created_at"] = questionnaire_dates
+
+    questionnaires = await Questionnaire.find(questionnaire_filter).sort("-created_at").to_list()
+    risk_filter = {"user_id": current_user.id}
+    risk_dates = {}
+    if range_start:
+        risk_dates["$gte"] = range_start
+    if range_end:
+        risk_dates["$lt"] = range_end
+    if risk_dates:
+        risk_filter["created_at"] = risk_dates
+    risk_assessments = await HealthRiskAssessment.find(risk_filter).sort("-created_at").to_list()
+    return SuccessResponse(
+        data=build_health_summary(current_user, questionnaires, risk_assessments, start_date, end_date)
+    )
+
+
+def _mongo_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
 
 
@@ -522,8 +722,24 @@ async def calculate_risk_assessment(
     
     Requires authentication. Rate limited to 30 requests per minute.
     """
+    if current_user.date_of_birth is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Add your date of birth to your profile before calculating risk",
+        )
+    age = age_from_date_of_birth(current_user.date_of_birth)
+    if age < 20:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Risk assessment requires an age of at least 20",
+        )
     try:
-        result = calculate_health_risk(payload)
+        result = calculate_health_risk(payload.model_copy(update={"age": age}))
+        assessment = HealthRiskAssessment(
+            user_id=current_user.id,
+            result=HealthRiskOutput.model_validate(result),
+        )
+        await assessment.insert()
         return SuccessResponse(data=result)
     except ValueError as e:
         raise HTTPException(
@@ -559,8 +775,19 @@ async def calculate_risk_assessment_anonymous(
     
     No authentication required. Rate limited to 10 requests per minute.
     """
+    if payload.date_of_birth is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Date of birth is required to calculate risk",
+        )
+    age = age_from_date_of_birth(payload.date_of_birth)
+    if age < 20:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Risk assessment requires an age of at least 20",
+        )
     try:
-        result = calculate_health_risk(payload)
+        result = calculate_health_risk(payload.model_copy(update={"age": age}))
         return SuccessResponse(data=result)
     except ValueError as e:
         raise HTTPException(
@@ -577,3 +804,345 @@ async def calculate_risk_assessment_anonymous(
 @app.get("/healthz", tags=["System"])
 def health_check():
     return {"success": True, "data": {"status": "ok"}}
+
+@app.post(
+    "/api/v1/prescriptions",
+    response_model=SuccessResponse[PrescriptionResponse],
+)
+async def create_prescription(
+    prescription_data: PrescriptionCreate,
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescription = Prescription(
+        user_id=current_user.id,
+        medication_name=prescription_data.medication_name,
+        dosage=prescription_data.dosage,
+        frequency=prescription_data.frequency,
+        next_dose=prescription_data.next_dose,
+    )
+
+    await prescription.insert()
+
+    return SuccessResponse(
+        data=PrescriptionResponse.model_validate(prescription)
+    )
+
+@app.get(
+    "/api/v1/prescriptions",
+    response_model=SuccessResponse[list[PrescriptionResponse]],
+)
+async def get_prescriptions(
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescriptions = await Prescription.find(
+        Prescription.user_id == current_user.id,
+        Prescription.archived == False,
+    ).to_list()
+
+    return SuccessResponse(
+        data=[
+            PrescriptionResponse.model_validate(prescription)
+            for prescription in prescriptions
+        ]
+    )
+
+@app.put(
+    "/api/v1/prescriptions/{prescription_id}",
+    response_model=SuccessResponse[PrescriptionResponse],
+)
+async def update_prescription(
+    prescription_id: uuid.UUID,
+    prescription_data: PrescriptionUpdate,
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescription = await Prescription.find_one(
+    Prescription.id == prescription_id,
+    Prescription.user_id == current_user.id,
+    Prescription.archived == False,
+)
+
+    if not prescription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prescription not found",
+        )
+
+    update_data = prescription_data.model_dump(exclude_unset=True)
+
+    for field, value in update_data.items():
+        setattr(prescription, field, value)
+
+    prescription.updated_at = datetime.utcnow()
+
+    await prescription.save()
+
+    return SuccessResponse(
+        data=PrescriptionResponse.model_validate(prescription)
+    )
+
+@app.patch(
+    "/api/v1/prescriptions/{prescription_id}/archive",
+    response_model=SuccessResponse[PrescriptionResponse],
+)
+async def archive_prescription(
+    prescription_id: uuid.UUID,
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescription = await Prescription.find_one(
+    Prescription.id == prescription_id,
+    Prescription.user_id == current_user.id,
+    Prescription.archived == False,
+)
+
+    if not prescription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prescription not found",
+        )
+
+    prescription.archived = True
+    prescription.archived_at = datetime.utcnow()
+    prescription.updated_at = datetime.utcnow()
+
+    await prescription.save()
+
+    return SuccessResponse(
+        data=PrescriptionResponse.model_validate(prescription)
+    )
+
+
+
+@app.post(
+    "/api/v1/prescriptions/{prescription_id}/doses",
+    response_model=SuccessResponse[MedicationDoseResponse],
+)
+async def record_medication_dose(
+    prescription_id: uuid.UUID,
+    dose_data: MedicationDoseCreate,
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescription = await Prescription.find_one(
+        Prescription.id == prescription_id,
+        Prescription.user_id == current_user.id,
+        Prescription.archived == False,
+    )
+
+    if not prescription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prescription not found",
+        )
+
+    existing_dose = await MedicationDose.find_one(
+        MedicationDose.user_id == current_user.id,
+        MedicationDose.prescription_id == prescription.id,
+        MedicationDose.scheduled_date == dose_data.scheduled_date,
+    )
+
+    if existing_dose:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A dose record already exists for this scheduled date",
+        )
+    dose = MedicationDose(
+        user_id=current_user.id,
+        prescription_id=prescription.id,
+        scheduled_date=dose_data.scheduled_date,
+        status=dose_data.status,
+    )
+
+    try:
+        await dose.insert()
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A dose record already exists for this scheduled date",
+        )
+
+    return SuccessResponse(
+        data=MedicationDoseResponse.model_validate(dose)
+    )
+
+
+@app.get(
+    "/api/v1/prescriptions/{prescription_id}/doses",
+    response_model=SuccessResponse[list[MedicationDoseResponse]],
+)
+async def get_medication_doses(
+    prescription_id: uuid.UUID,
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescription = await Prescription.find_one(
+        Prescription.id == prescription_id,
+        Prescription.user_id == current_user.id,
+        Prescription.archived == False,
+    )
+
+    if not prescription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prescription not found",
+        )
+
+    doses = await MedicationDose.find(
+        MedicationDose.user_id == current_user.id,
+        MedicationDose.prescription_id == prescription.id,
+    ).sort(-MedicationDose.recorded_at).to_list()
+
+    return SuccessResponse(
+        data=[
+            MedicationDoseResponse.model_validate(dose)
+            for dose in doses
+        ]
+    )
+
+@app.post(
+    "/api/v1/prescriptions/{prescription_id}/reminder",
+    response_model=SuccessResponse[MedicationReminderResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_medication_reminder(
+    prescription_id: uuid.UUID,
+    reminder_data: MedicationReminderCreate,
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescription = await Prescription.find_one(
+        Prescription.id == prescription_id,
+        Prescription.user_id == current_user.id,
+        Prescription.archived == False,
+    )
+
+    if not prescription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prescription not found",
+        )
+
+    existing_reminder = await MedicationReminder.find_one(
+        MedicationReminder.user_id == current_user.id,
+        MedicationReminder.prescription_id == prescription.id,
+    )
+
+    if existing_reminder:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A reminder already exists for this prescription",
+        )
+
+    now = datetime.now(timezone.utc)
+    reminder = MedicationReminder(
+        user_id=current_user.id,
+        prescription_id=prescription.id,
+        reminder_time=reminder_data.reminder_time,
+        enabled=False,
+        paused=False,
+        created_at=now,
+        updated_at=now,
+    )
+    try:
+        await reminder.insert()
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A reminder already exists for this prescription",
+        )
+
+    return SuccessResponse(
+        data=MedicationReminderResponse.model_validate(reminder)
+    )
+
+
+@app.get(
+    "/api/v1/prescriptions/{prescription_id}/reminder",
+    response_model=SuccessResponse[
+        Optional[MedicationReminderResponse]
+    ],
+)
+async def get_medication_reminder(
+    prescription_id: uuid.UUID,
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescription = await Prescription.find_one(
+        Prescription.id == prescription_id,
+        Prescription.user_id == current_user.id,
+        Prescription.archived == False,
+    )
+
+    if not prescription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prescription not found",
+        )
+
+    reminder = await MedicationReminder.find_one(
+        MedicationReminder.user_id == current_user.id,
+        MedicationReminder.prescription_id == prescription.id,
+    )
+
+    if not reminder:
+        return SuccessResponse(data=None)
+
+    return SuccessResponse(
+        data=MedicationReminderResponse.model_validate(reminder)
+    )
+
+
+@app.patch(
+    "/api/v1/prescriptions/{prescription_id}/reminder",
+    response_model=SuccessResponse[MedicationReminderResponse],
+)
+async def update_medication_reminder(
+    prescription_id: uuid.UUID,
+    reminder_data: MedicationReminderUpdate,
+    current_user: Annotated[User, Depends(require_health_consent)],
+):
+    prescription = await Prescription.find_one(
+        Prescription.id == prescription_id,
+        Prescription.user_id == current_user.id,
+        Prescription.archived == False,
+    )
+
+    if not prescription:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Prescription not found",
+        )
+
+    reminder = await MedicationReminder.find_one(
+        MedicationReminder.user_id == current_user.id,
+        MedicationReminder.prescription_id == prescription.id,
+    )
+
+    if not reminder:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Reminder not found",
+        )
+
+    updates = reminder_data.model_dump(exclude_unset=True)
+
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one reminder setting must be provided",
+        )
+
+    if (
+        updates.get("paused", reminder.paused)
+        and not updates.get("enabled", reminder.enabled)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="A disabled reminder cannot be paused",
+        )
+
+    for field, value in updates.items():
+        setattr(reminder, field, value)
+
+    reminder.updated_at = datetime.now(timezone.utc)
+    await reminder.save()
+
+    return SuccessResponse(
+        data=MedicationReminderResponse.model_validate(reminder)
+    )
+

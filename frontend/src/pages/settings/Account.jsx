@@ -3,21 +3,30 @@ import { useTranslation } from 'react-i18next';
 import PageShell from '../../components/PageShell';
 import { useAuth } from '../../hooks/useAuth.js';
 import { showSuccessToast } from '../../lib/toast.js';
+import { userHasValidHealthConsent } from '../../lib/consentConstants.js';
+import { authService } from '../../services/authService.js';
 
 const Account = () => {
   const { t } = useTranslation(['common', 'auth', 'errors']);
-  const { user, updateProfile, uploadProfilePhoto, initializing } = useAuth();
-  const [form, setForm] = useState({ name: '', age: '', phone: '' });
+  const { user, consentStatus, updateProfile, uploadProfilePhoto, initializing } = useAuth();
+  // Prefer the backend's consent verdict; fall back to the same rule locally until it loads.
+  const hasValidHealthConsent = consentStatus
+    ? Boolean(consentStatus.consent_given)
+    : userHasValidHealthConsent(user);
+  const [form, setForm] = useState({ name: '', date_of_birth: '', phone: '' });
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState(null);
   const [photoError, setPhotoError] = useState(null);
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
+  const [exportingData, setExportingData] = useState(false);
+  const [exportError, setExportError] = useState('');
+  const [exportStatus, setExportStatus] = useState('');
 
   useEffect(() => {
     if (user) {
       setForm({
         name: user.name || '',
-        age: user.age || '',
+        date_of_birth: user.date_of_birth || '',
         phone: user.phone || '',
       });
     }
@@ -71,7 +80,7 @@ const Account = () => {
     try {
       await updateProfile({
         name: form.name.trim(),
-        age: Number(form.age),
+        date_of_birth: form.date_of_birth,
         phone: form.phone.trim(),
       });
       showSuccessToast('common:profileUpdated', t('common:profileUpdated', 'Profile updated.'));
@@ -109,6 +118,30 @@ const Account = () => {
     } finally {
       setUploadingPhoto(false);
       event.target.value = '';
+    }
+  };
+
+  const onExportData = async () => {
+    setExportError('');
+    setExportStatus('');
+    setExportingData(true);
+    try {
+      const data = await authService.exportOwnData();
+      const objectUrl = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = 'my-health-data.json';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+
+      const hasHealthRecords = data.questionnaires?.length || data.risk_assessments?.length;
+      setExportStatus(t(hasHealthRecords ? 'common:privacyExportSuccess' : 'common:privacyExportEmpty'));
+    } catch {
+      setExportError(t('common:privacyExportError'));
+    } finally {
+      setExportingData(false);
     }
   };
 
@@ -167,20 +200,25 @@ const Account = () => {
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div>
-                <label htmlFor="age" className="block text-sm font-medium text-gray-700">
-                  {t('auth:age', 'Age')}
+                <label htmlFor="date_of_birth" className="block text-sm font-medium text-gray-700">
+                  {t('auth:dateOfBirth', 'Date of birth')}
                 </label>
                 <input
-                  type="number"
-                  id="age"
-                  name="age"
-                  value={form.age}
+                  type="date"
+                  id="date_of_birth"
+                  name="date_of_birth"
+                  value={form.date_of_birth}
                   onChange={onChange}
-                  min="13"
-                  max="120"
+                  max={new Date().toISOString().slice(0, 10)}
                   className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
                   required
                 />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700">
+                  {t('auth:age', 'Age')}
+                </label>
+                <p className="mt-1 px-3 py-2 text-gray-900">{user?.age ?? '-'}</p>
               </div>
               <div>
                 <label htmlFor="phone" className="block text-sm font-medium text-gray-700">
@@ -209,6 +247,40 @@ const Account = () => {
             </div>
           </form>
         </div>
+
+        <section className="mt-6 border-t border-gray-200 pt-6" aria-labelledby="privacy-controls-title">
+          <h2 id="privacy-controls-title" className="text-lg font-semibold text-gray-900">
+            {t('common:privacyControlsTitle')}
+          </h2>
+
+          <div className="mt-5 border-t border-gray-200 pt-5">
+            <h3 className="font-medium text-gray-900">{t('common:privacyExportTitle')}</h3>
+            <p className="mt-1 text-sm text-gray-600">{t('common:privacyExportDescription')}</p>
+            <button
+              type="button"
+              onClick={onExportData}
+              disabled={exportingData}
+              className="mt-3 rounded border border-teal-800 px-4 py-2 text-sm font-medium text-teal-900 hover:bg-teal-50 focus:outline-none focus:ring-2 focus:ring-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {exportingData ? t('common:privacyExportLoading') : t('common:privacyExportButton')}
+            </button>
+            {exportStatus ? <p role="status" className="mt-2 text-sm text-green-800">{exportStatus}</p> : null}
+            {exportError ? <p role="alert" className="mt-2 text-sm text-red-700">{exportError}</p> : null}
+          </div>
+
+          <div className="mt-5 border-t border-gray-200 pt-5">
+            <h3 className="font-medium text-gray-900">{t('common:privacyRetentionTitle')}</h3>
+            <p className="mt-1 text-sm text-gray-600">{t('common:privacyRetentionDescription')}</p>
+          </div>
+
+          <div className="mt-5 border-t border-gray-200 pt-5">
+            <h3 className="font-medium text-gray-900">{t('common:privacyConsentTitle')}</h3>
+            <p className="mt-1 text-sm text-gray-600">
+              {t(hasValidHealthConsent ? 'common:privacyConsentGranted' : 'common:privacyConsentNotGranted')}
+            </p>
+            <p className="mt-1 text-sm text-gray-600">{t('common:privacyConsentDescription')}</p>
+          </div>
+        </section>
       </div>
     </PageShell>
   );
